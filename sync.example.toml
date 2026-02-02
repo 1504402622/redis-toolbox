@@ -1,0 +1,69 @@
+# Redis Toolbox用于配置 Redis 数据同步工具
+
+# 运行模式，目前只支持 "sync"（同步模式）
+mode = "sync"
+
+[reader]
+addr = "10.2.0.42:6379"
+password = "Cloud@123"
+
+[writer]
+addr = "127.0.0.1:26379"
+password = ""
+
+[log]
+# 日志级别：debug（调试）, info（信息）, warn（警告）, error（错误）
+level = "info"
+# 日志文件路径，如果为空则只输出到 stdout
+file = ""
+# 是否同时输出到标准输出（控制台）
+stdout = true
+
+[filter]
+# 阻止同步的key列表
+# 示例: block_key_prefix = ["temp:%", "cache:%", "test"]  # temp% 和 cache% 是模糊匹配，test 是精准匹配
+block_key_prefix = ["test:%"]
+
+# 阻止同步的命令列表
+# 示例: block_command = ["FLUSHDB", "FLUSHALL", "DEL"]
+block_command = []
+
+# 阻止同步的数据库编号列表
+# 示例: block_db = [1, 2]  # 阻止数据库 1 和 2
+block_db = []
+
+# Channel 配置
+# 控制命令缓冲队列的大小和行为
+[channel]
+# 全局命令缓冲队列大小，用于 reader 和 writer 之间的缓冲
+# 建议根据命令频率设置，命令频率高时设置较大值（如 10000-50000）
+global_size = 10000
+# Channel 满后等待时间（秒），超过此时间后丢弃命令并暂停 reader
+drop_wait_seconds = 3
+
+
+[sync]
+# 批量发送命令的数量，达到此数量时立即发送到 writer
+# 建议根据网络延迟和命令大小设置，网络延迟高时设置较大值（如 5000-10000）
+pipeline_batch = 2500
+# Writer 批量发送超时时间（毫秒），即使未达到 pipeline_batch 也会发送
+# 建议设置为 10-200 毫秒
+writer_send_timeout_ms = 100
+# 重连间隔时间（毫秒），连接失败后等待此时间后重试
+# 建议设置为 1000-5000 毫秒
+reconnect_interval_ms = 2000
+# 启动时是否执行全量同步（FULLRESYNC）
+# true: 启动时重新同步，丢弃之前的位置信息
+# false: 从上次位置继续同步（增量同步）
+full_sync_on_start = true
+# 是否在 reader 断开超过时间后触发重新同步
+# true: reader 断开超时后触发重新同步
+# false: reader 断开后只重连，不触发重新同步
+reload_rdb_on_reader_disconnect = false
+# reader 断开超时时间（秒），超过此时间后触发重新同步
+# 建议设置为 60-600 秒（1-10 分钟）
+reader_disconnect_timeout_seconds = 1
+# 是否在 channel 满后触发重新同步
+# true: channel 满后只丢弃命令并暂停, 触发重新同步
+# false: channel 满后只丢弃命令并暂停, 不触发重新同步
+reload_rdb_on_channel_full = false

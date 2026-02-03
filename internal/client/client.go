@@ -12,6 +12,13 @@ import (
 	"redis-toolbox/internal/log"
 )
 
+const (
+	// 命令发送日志输出间隔（每N个命令打印一次）
+	LogIntervalCommandSent = 1000
+	// 命令过滤日志输出间隔（每N个命令打印一次）
+	LogIntervalCommandFiltered = 10000
+)
+
 type Command struct {
 	Raw  string
 	Name string
@@ -66,9 +73,8 @@ func (r *ReaderClient) GetSource() CommandSource {
 	return r.source
 }
 
-func (r *ReaderClient) Start(ctx context.Context) {
+func (r *ReaderClient) Start(ctx context.Context, reconnectInterval time.Duration) {
 	go func() {
-		reconnectInterval := 1 * time.Second
 		for {
 			// 上下文取消时退出
 			select {
@@ -101,7 +107,10 @@ func (r *ReaderClient) Start(ctx context.Context) {
 
 			// 过滤命令
 			if r.filter != nil && !r.filter.Allow(cmd) {
-				log.Infof("command filtered: %s (key: %s, db: %d)", cmd.Name, cmd.Key, cmd.DB)
+				// 减少日志输出频率
+				if r.offset.Load()%LogIntervalCommandFiltered == 0 {
+					log.Infof("command filtered: %s (key: %s, db: %d, total: %d)", cmd.Name, cmd.Key, cmd.DB, r.offset.Load())
+				}
 				continue
 			}
 
@@ -115,8 +124,8 @@ func (r *ReaderClient) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case r.globalCh <- cmd:
-				// 命令已发送，减少日志输出频率（每1000个key打印一次）
-				if r.offset.Load()%1000 == 0 {
+				// 命令已发送，减少日志输出频率
+				if r.offset.Load()%LogIntervalCommandSent == 0 {
 					log.Infof("command sent to global channel: %s (key: %s, db: %d, total: %d)",
 						cmd.Name, cmd.Key, cmd.DB, r.offset.Load())
 				}

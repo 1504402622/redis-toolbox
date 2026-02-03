@@ -12,6 +12,17 @@ import (
 	"redis-toolbox/internal/log"
 )
 
+const (
+	// PauseCheckInterval 暂停检查间隔
+	PauseCheckInterval = 100 * time.Millisecond
+	// ChannelFullThreshold channel 满的阈值（百分比）
+	ChannelFullThreshold = 0.95
+	// StatsReportInterval 统计信息报告间隔
+	StatsReportInterval = 30 * time.Second
+	// MaxPendingRetrySize pending 失败重试的最大大小，超过此大小则丢弃旧命令
+	MaxPendingRetrySize = 100000
+)
+
 // Service 管理一个 reader 和一个 writer 的同步服务
 type Service struct {
 	cfg                  config.Config
@@ -21,7 +32,7 @@ type Service struct {
 	globalCh             chan client.Command
 	pauseReader          atomic.Bool
 	dropUntil            atomic.Value
-	needFullReload       atomic.Bool // 是否需要全量重载
+	needFullReload       atomic.Bool // 是否需要全量重载（现阶段暂真正作用并没有发挥）
 	readerDisconnectTime *time.Time  // reader 断开时间记录
 	mu                   sync.RWMutex
 }
@@ -46,77 +57,114 @@ func (s *Service) Start(ctx context.Context) {
 	if s.cfg.Sync.FullSyncOnStart {
 		s.needFullReload.Store(true)
 	}
+	reconnectInterval := time.Duration(s.cfg.Sync.ReconnectIntervalMS) * time.Millisecond
 
 	// 启动 reader
 	log.Infof("starting reader: %s", s.cfg.Reader.Addr)
-	s.reader.Start(ctx)
+	s.reader.Start(ctx, reconnectInterval)
 
 	// 启动 writer
 	log.Infof("starting writer: %s", s.cfg.Writer.Addr)
-	go s.runWriter(ctx, s.writer)
+	go s.runWriter(ctx, s.writer, reconnectInterval)
 
-	go s.dispatchWriter(ctx)
-	go s.monitor(ctx)
+	go s.dispatchWriter(ctx, reconnectInterval)
+	go s.monitor(ctx, reconnectInterval)
 }
 
 // dispatchWriter 从全局 channel 读取命令并发送到 writer
-func (s *Service) dispatchWriter(ctx context.Context) {
+func (s *Service) dispatchWriter(ctx context.Context, reconnectInterval time.Duration) {
 	sendTimeout := time.Duration(s.cfg.Sync.WriterSendTimeoutMS) * time.Millisecond
 	var pending []client.Command
 
 	for {
+		// 检查是否需要全量重载
 		if s.needFullReload.Load() {
 			s.performFullReload("pending full reload")
 		}
 
+		// 检查服务是否暂停
 		if s.isPaused() {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(PauseCheckInterval)
 			continue
 		}
-		// 检查 writer 是否在线，如果不在线则尝试连接
+
+		// 检查writer连接状态
 		if !s.hasAnyWriterConnected() {
 			log.Warnf("writer offline, attempting to connect...")
 			if err := s.writer.Connect(); err != nil {
 				log.Warnf("writer connect failed: %v, retrying...", err)
-				time.Sleep(time.Duration(s.cfg.Sync.ReconnectIntervalMS) * time.Millisecond)
+				time.Sleep(reconnectInterval)
 				continue
 			}
 			log.Infof("writer connected successfully")
 		}
 
 		timer := time.NewTimer(sendTimeout)
-		// 1.瞬时批量大于2500发送，2.超出定时时间发出
+
+		// 等待三种事件：上下文取消、新命令到达、发送超时
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			if len(pending) > 0 {
-				_ = s.sendToWriter(ctx, pending)
-			}
+			s.flushPendingCommands(ctx, pending, reconnectInterval)
 			return
+
 		case cmd := <-s.globalCh:
-			if !timer.Stop() {
-				<-timer.C
-			}
+			timer.Stop()
 			pending = append(pending, cmd)
+
+			// 检查是否达到批量发送阈值
 			if len(pending) >= s.cfg.Sync.PipelineBatch {
-				if err := s.sendToWriter(ctx, pending); err == nil {
-					pending = pending[:0]
-				}
-				timer.Reset(sendTimeout)
+				s.sendAndReset(ctx, &pending, timer, sendTimeout, reconnectInterval)
 			}
+
 		case <-timer.C:
-			// 超时，发送已收集的命令
+			// 超时发送
 			if len(pending) > 0 {
-				if err := s.sendToWriter(ctx, pending); err == nil {
-					pending = pending[:0]
-				}
+				s.handleTimeoutSend(ctx, &pending, timer, sendTimeout, reconnectInterval)
 			}
-			timer.Reset(sendTimeout)
 		}
 	}
 }
 
-func (s *Service) sendToWriter(ctx context.Context, cmds []client.Command) error {
+// flushPendingCommands 刷新所有待处理命令
+func (s *Service) flushPendingCommands(ctx context.Context, pending []client.Command, reconnectInterval time.Duration) {
+	if len(pending) > 0 {
+		_ = s.sendToWriter(ctx, pending, reconnectInterval)
+	}
+}
+
+// sendAndReset 发送命令并重置状态
+func (s *Service) sendAndReset(ctx context.Context, pending *[]client.Command, timer *time.Timer,
+	sendTimeout time.Duration, reconnectInterval time.Duration) {
+
+	if err := s.sendToWriter(ctx, *pending, reconnectInterval); err == nil {
+		*pending = (*pending)[:0] // 清空待处理队列
+	}
+	timer.Reset(sendTimeout)
+}
+
+// handleTimeoutSend 处理超时发送逻辑
+func (s *Service) handleTimeoutSend(ctx context.Context, pending *[]client.Command, timer *time.Timer,
+	sendTimeout time.Duration, reconnectInterval time.Duration) {
+
+	if err := s.sendToWriter(ctx, *pending, reconnectInterval); err == nil {
+		*pending = (*pending)[:0] // 清空待处理队列
+	} else {
+		s.handleSendFailure(pending)
+	}
+	timer.Reset(sendTimeout)
+}
+
+// handleSendFailure 处理发送失败的情况
+func (s *Service) handleSendFailure(pending *[]client.Command) {
+	if len(*pending) >= MaxPendingRetrySize {
+		dropCount := len(*pending) / 2
+		log.Warnf("send failed, pending queue too large (%d), dropping %d old commands",
+			len(*pending), dropCount)
+		*pending = (*pending)[dropCount:] // 丢弃一半旧命令
+	}
+}
+func (s *Service) sendToWriter(ctx context.Context, cmds []client.Command, reconnectInterval time.Duration) error {
 	if len(cmds) == 0 {
 		return nil
 	}
@@ -130,12 +178,12 @@ func (s *Service) sendToWriter(ctx context.Context, cmds []client.Command) error
 		}
 	}
 
-	log.Infof("sending batch to writer: %d commands", len(cmds))
+	log.Debugf("sending batch to writer: %d commands", len(cmds))
 	if err := s.writer.WriteBatch(ctx, cmds); err != nil {
 		log.Errorf("write batch failed: %v", err)
 		s.writer.Close()
 		// 触发重连
-		time.Sleep(time.Duration(s.cfg.Sync.ReconnectIntervalMS) * time.Millisecond)
+		time.Sleep(reconnectInterval)
 		if err := s.writer.Connect(); err != nil {
 			log.Errorf("writer reconnect failed: %v", err)
 		}
@@ -145,24 +193,23 @@ func (s *Service) sendToWriter(ctx context.Context, cmds []client.Command) error
 	return nil
 }
 
-func (s *Service) runWriter(ctx context.Context, writer *client.RedisWriter) {
-	reconnectInterval := time.Duration(s.cfg.Sync.ReconnectIntervalMS) * time.Millisecond
+// runWriter 后台保持 writer 连接，定期检查并重连
+// 注意：实际的写入操作在 dispatchWriter 中处理，此函数仅负责连接保活
+func (s *Service) runWriter(ctx context.Context, writer *client.RedisWriter, reconnectInterval time.Duration) {
+	ticker := time.NewTicker(reconnectInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-		}
-
-		if !writer.IsConnected() {
-			if err := writer.Connect(); err != nil {
-				log.Errorf("writer connect failed: %v, retrying...", err)
-				time.Sleep(reconnectInterval)
-				continue
+		case <-ticker.C:
+			if !writer.IsConnected() {
+				if err := writer.Connect(); err != nil {
+					log.Errorf("writer connect failed: %v, retrying...", err)
+				}
 			}
 		}
-
-		time.Sleep(reconnectInterval)
 	}
 }
 
@@ -239,9 +286,7 @@ func (s *Service) isPaused() bool {
 	return true
 }
 
-func (s *Service) monitor(ctx context.Context) {
-	reconnectInterval := time.Duration(s.cfg.Sync.ReconnectIntervalMS) * time.Millisecond
-	statsInterval := 30 * time.Second // 每30秒输出一次统计信息
+func (s *Service) monitor(ctx context.Context, reconnectInterval time.Duration) {
 	lastStatsTime := time.Now()
 
 	for {
@@ -254,7 +299,7 @@ func (s *Service) monitor(ctx context.Context) {
 			s.checkChannelFull()
 
 			// 定期输出filter统计信息
-			if time.Since(lastStatsTime) >= statsInterval {
+			if time.Since(lastStatsTime) >= StatsReportInterval {
 				total, blocked, allowed := s.filter.Stats()
 				if total > 0 {
 					blockRate := float64(blocked) / float64(total) * 100
@@ -273,8 +318,8 @@ func (s *Service) checkChannelFull() {
 	channelCap := cap(s.globalCh)
 	s.mu.RUnlock()
 
-	// 检查 channel 是否满了（使用 95% 作为阈值，避免频繁触发）
-	if channelLen >= int(float64(channelCap)*0.95) {
+	// 检查 channel 是否满了（使用阈值避免频繁触发）
+	if channelLen >= int(float64(channelCap)*ChannelFullThreshold) {
 		s.dropAll("global channel full")
 	}
 }

@@ -107,8 +107,8 @@ func LoadConfig(path string) (Config, error) {
 		return cfg, fmt.Errorf("parse toml failed: %w", err)
 	}
 
-	fmt.Printf("  reader[%d]: %s\n", cfg.Reader.Addr)
-	fmt.Printf("  writer[%d]: %s\n", cfg.Writer.Addr)
+	fmt.Printf("  reader: %s\n", cfg.Reader.Addr)
+	fmt.Printf("  writer: %s\n", cfg.Writer.Addr)
 
 	return cfg, nil
 }

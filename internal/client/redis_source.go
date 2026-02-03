@@ -17,6 +17,13 @@ import (
 	"redis-toolbox/internal/log"
 )
 
+const (
+	// LogIntervalParseError 解析错误日志输出间隔（每N个命令打印一次）
+	LogIntervalParseError = 1000
+	// LogIntervalParsedCommand 解析命令日志输出间隔（每N个命令打印一次）
+	LogIntervalParsedCommand = 10000
+)
+
 var (
 	ErrConnectionFailed = errors.New("connection failed")
 	ErrPSyncFailed      = errors.New("psync failed")
@@ -157,33 +164,37 @@ func (r *RedisSource) readBulkString() ([]byte, error) {
 	return data, nil
 }
 
-// 当前仅aof模式
+// 当前仅支持 AOF 模式，启动 PSYNC 同步流程
 func (r *RedisSource) startPSync(ctx context.Context) error {
 	replID := r.ReplID()
 	offset := r.Offset()
 
+	// 构建 PSYNC 命令：首次同步/偏移量为0时走全量，否则走增量
 	var psyncCmd string
 	if replID == "" || offset == 0 {
-		psyncCmd = "PSYNC ? -1"
+		psyncCmd = "PSYNC ? -1" // 全量同步
 	} else {
-		psyncCmd = fmt.Sprintf("PSYNC %s %d", replID, offset)
+		psyncCmd = fmt.Sprintf("PSYNC %s %d", replID, offset) // 增量同步
 	}
 
 	log.Infof("sending PSYNC: %s", psyncCmd)
+	// 发送 PSYNC 命令到 Redis 主节点
 	if err := r.sendCommand("PSYNC", replID, strconv.FormatInt(offset, 10)); err != nil {
 		return fmt.Errorf("%w: %v", ErrPSyncFailed, err)
 	}
 
+	// 读取 PSYNC 响应
 	resp, err := r.readResponse()
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrPSyncFailed, err)
 	}
 
+	// 校验响应合法性：仅支持 FULLRESYNC/CONTINUE
 	if !strings.HasPrefix(resp, "+FULLRESYNC") && !strings.HasPrefix(resp, "+CONTINUE") {
 		return fmt.Errorf("%w: unexpected response: %s", ErrPSyncFailed, resp)
 	}
 
-	// 解析 replid 和 offset
+	// 解析响应中的 replID 和 offset 并更新本地状态
 	parts := strings.Fields(resp)
 	if len(parts) >= 3 {
 		r.replID.Store(parts[1])
@@ -192,29 +203,34 @@ func (r *RedisSource) startPSync(ctx context.Context) error {
 		}
 	}
 
+	// 处理全量同步（FULLRESYNC）逻辑：跳过 RDB 数据（仅 AOF 模式）
 	if strings.HasPrefix(resp, "+FULLRESYNC") {
 		log.Infof("FULLRESYNC started: replid=%s, offset=%d", r.ReplID(), r.Offset())
-		r.resyncing.Store(true) // 标记正在重新同步(当前模拟rdb)
+		r.resyncing.Store(true) // 标记正在全量同步（当前仅模拟 RDB 处理）
 
-		// Redis PSYNC 协议：FULLRESYNC 后直接发送 $<size>\r\n，然后就是 RDB 数据
-		// 现在只做AOF解析，直接跳过RDB数据
+		// Redis PSYNC 协议：FULLRESYNC 后会返回 $<size>\r\n 格式的 RDB 大小，随后是 RDB 数据
 		var size int64
-		var err error
+		var readSizeErr error
 
+		// 优先通过 readBulkString 读取 RDB 大小，失败则手动重试读取
 		rdbSizeBytes, bulkErr := r.readBulkString()
 		if bulkErr != nil {
-			// readBulkString 失败，尝试手动读取
 			log.Infof("readBulkString failed: %v, trying manual read", bulkErr)
 
-			// 读取多行，直到找到 $<size> 格式
-			maxRetries := 30                     // 增加重试次数
-			retryDelay := 100 * time.Millisecond // 每次重试之间的延迟
+			// 手动读取 RDB 大小：重试机制避免临时网络/解析问题
+			const (
+				maxRetries  = 30                     // 最大重试次数
+				retryDelay  = 100 * time.Millisecond // 重试间隔
+				readTimeout = 5 * time.Second        // 单次读取超时
+			)
+
 			for i := 0; i < maxRetries; i++ {
 				// 设置读取超时
 				if r.conn != nil {
-					r.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+					r.conn.SetReadDeadline(time.Now().Add(readTimeout))
 				}
 
+				// 读取单行数据
 				line, readErr := r.reader.ReadString('\n')
 				if readErr != nil {
 					log.Infof("read rdb size line failed (retry %d/%d): %v", i+1, maxRetries, readErr)
@@ -230,9 +246,11 @@ func (r *RedisSource) startPSync(ctx context.Context) error {
 					r.conn.SetReadDeadline(time.Time{})
 				}
 
+				// 清理行尾空白符
 				line = strings.TrimSuffix(line, "\r\n")
 				line = strings.TrimSpace(line)
 
+				// 跳过空行
 				if line == "" {
 					if i < maxRetries-1 {
 						time.Sleep(retryDelay)
@@ -242,76 +260,85 @@ func (r *RedisSource) startPSync(ctx context.Context) error {
 
 				log.Infof("read rdb size line (retry %d): %q", i+1, line)
 
+				// 解析 $<size> 格式的 RDB 大小
 				if strings.HasPrefix(line, "$") {
-					size, err = strconv.ParseInt(line[1:], 10, 64)
-					if err != nil {
-						return fmt.Errorf("parse rdb size failed: %w (line: %q)", err, line)
+					size, readSizeErr = strconv.ParseInt(line[1:], 10, 64)
+					if readSizeErr != nil {
+						return fmt.Errorf("parse rdb size failed: %w (line: %q)", readSizeErr, line)
 					}
 					break
 				}
 
-				// 如果不是 $ 开头，等待一下再重试
+				// 非 $ 开头，等待重试
 				if i < maxRetries-1 {
 					time.Sleep(retryDelay)
 				}
 			}
 
+			// 校验 RDB 大小是否读取成功
 			if size == 0 {
 				return fmt.Errorf("failed to read rdb size after %d retries", maxRetries)
 			}
 		} else {
-			// readBulkString 成功
+			// readBulkString 读取成功，解析 RDB 大小
 			if len(rdbSizeBytes) == 0 {
 				return fmt.Errorf("rdb size is empty")
 			}
-			size, err = strconv.ParseInt(string(rdbSizeBytes), 10, 64)
-			if err != nil {
-				return fmt.Errorf("parse rdb size failed: %w (size bytes: %q)", err, string(rdbSizeBytes))
+			size, readSizeErr = strconv.ParseInt(string(rdbSizeBytes), 10, 64)
+			if readSizeErr != nil {
+				return fmt.Errorf("parse rdb size failed: %w (size bytes: %q)", readSizeErr, string(rdbSizeBytes))
 			}
 		}
 
 		log.Infof("RDB file size: %d bytes, skipping RDB data Parse (AOF only mode)", size)
 
-		// TODO 只读取加载并跳过 RDB 数据
+		// 仅读取并跳过 RDB 数据（不解析，因为当前仅支持 AOF 模式）
 		rdbReader := io.LimitReader(r.reader, size)
-		buf := make([]byte, 64*1024) // 64KB buffer
+		buf := make([]byte, 64*1024) // 64KB 缓冲区，避免内存占用过大
 		var totalRead int64
 		lastLogTime := time.Now()
 
+		// 循环读取 RDB 数据并丢弃
 		for totalRead < size {
+			// 监听上下文取消，支持优雅退出
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
 			}
 
+			// 计算本次要读取的字节数（不超过缓冲区大小）
 			toRead := size - totalRead
 			if toRead > int64(len(buf)) {
 				toRead = int64(len(buf))
 			}
 
-			n, err := io.ReadFull(rdbReader, buf[:toRead])
-			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-				return fmt.Errorf("read rdb failed at offset %d: %w", totalRead, err)
+			// 读取 RDB 数据块
+			n, readErr := io.ReadFull(rdbReader, buf[:toRead])
+			if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+				return fmt.Errorf("read rdb failed at offset %d: %w", totalRead, readErr)
 			}
 
+			// 更新已读取总量
 			totalRead += int64(n)
 
-			// 每 10MB 或每 5 秒打印一次进度
+			// 每 10MB 或 5 秒打印一次跳过进度，提升可观测性
 			if totalRead%int64(10*1024*1024) == 0 || time.Since(lastLogTime) > 5*time.Second {
 				progress := float64(totalRead) / float64(size) * 100
 				log.Infof("RDB skipping progress: %d/%d bytes (%.1f%%)", totalRead, size, progress)
 				lastLogTime = time.Now()
 			}
 
-			if err == io.EOF || totalRead >= size {
+			// 读取完成则退出循环
+			if readErr == io.EOF || totalRead >= size {
 				break
 			}
 		}
 
 		log.Infof("FULLRESYNC completed: RDB skipped (%d bytes), ready for incremental sync", totalRead)
-		r.resyncing.Store(false) // 重新同步完成
+		r.resyncing.Store(false) // 标记全量同步完成
 	} else {
+		// 处理增量同步（CONTINUE）逻辑
 		log.Infof("CONTINUE: replid=%s, offset=%d", r.ReplID(), r.Offset())
 	}
 
@@ -429,11 +456,12 @@ func (r *RedisSource) Next(ctx context.Context) (Command, error) {
 		// 检查是否是命令格式（以 * 开头）
 		if !strings.HasPrefix(line, "*") {
 			// 不是命令格式，可能是其他类型的响应，跳过
-			log.Infof("skipping non-command line: %q", line)
+			// 减少日志输出频率
+			if r.offset.Load()%LogIntervalParsedCommand == 0 {
+				log.Infof("skipping non-command line: %q (offset: %d)", line, r.offset.Load())
+			}
 			continue
 		}
-
-		log.Infof("received command line: %q", line)
 
 		cmd, err := r.parseAOFCommand(line)
 		if err != nil {
@@ -442,7 +470,7 @@ func (r *RedisSource) Next(ctx context.Context) (Command, error) {
 		}
 
 		r.offset.Add(1)
-		log.Infof("parsed AOF command: %s (key: %s, db: %d)", cmd.Name, cmd.Key, cmd.DB)
+		log.Debugf("parsed AOF command: %s (key: %s, db: %d)", cmd.Name, cmd.Key, cmd.DB)
 		return cmd, nil
 	}
 }

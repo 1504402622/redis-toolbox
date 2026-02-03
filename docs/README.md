@@ -19,7 +19,6 @@ redis-toolbox ./sync.toml
 ## 运行说明
 
 - 当前仅支持 `mode = "sync"`。
-- `sync.mock_source = true` 时启用内置 mock 源，方便本地演示与验证流程。
 - 如果要接入真实 Redis，需替换 `ReaderClient` 的 `CommandSource` 实现，读取 PSYNC/RDB/AOF。
 
 ## 核心流程
@@ -27,6 +26,6 @@ redis-toolbox ./sync.toml
 1. 加载 TOML 配置并初始化 client/log/filter。
 2. 创建 reader/writer 客户端，维护 offset/replid 与各自的 channel。
 3. 启动同步：全局 channel 缓冲、过滤器筛选、writer 批量 pipeline 写入。
-4. 异常容灾：global channel 溢出丢弃 + 3 分钟暂停，reader 断线重连，writer 超时回压，必要时触发 RDB 全量重载。
+4. 异常容灾：global channel 溢出丢弃 ，reader\writer 断线重连。
 
 

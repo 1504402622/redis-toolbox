@@ -43,20 +43,18 @@ func monitor(cancel context.CancelFunc) {
 }
 
 func registerClient(cfg config.Config) *syncer.Service {
-	// 创建全局 channel
-	globalCh := make(chan client.Command, cfg.Channel.GlobalSize)
-
 	// 创建 filter
 	filterer := filter.New(cfg.Filter)
 
-	// reader - 直接输出到 globalCh，并在输出前过滤
+	// 创建reader - 直接输出到 globalCh，并在输出前过滤
+	globalCh := make(chan client.Command, cfg.Channel.GlobalSize)
 	readerCfg := cfg.Reader
 	reader := client.NewReader(readerCfg, globalCh, filterer)
 	redisSource := client.NewRedisSource(readerCfg)
 	reader.SetSource(redisSource)
 	log.Infof("using real Redis PSYNC source for reader %s (AOF only mode)", readerCfg.Addr)
 
-	// writer
+	// 创建writer
 	writer := client.NewRedisWriter(cfg.Writer)
 	return syncer.New(cfg, filterer, reader, writer, globalCh)
 }

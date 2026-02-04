@@ -17,13 +17,6 @@ import (
 	"redis-toolbox/internal/log"
 )
 
-const (
-	// LogIntervalParseError 解析错误日志输出间隔（每N个命令打印一次）
-	LogIntervalParseError = 1000
-	// LogIntervalParsedCommand 解析命令日志输出间隔（每N个命令打印一次）
-	LogIntervalParsedCommand = 10000
-)
-
 var (
 	ErrConnectionFailed = errors.New("connection failed")
 	ErrPSyncFailed      = errors.New("psync failed")
@@ -164,7 +157,7 @@ func (r *RedisSource) readBulkString() ([]byte, error) {
 	return data, nil
 }
 
-// 当前仅支持 AOF 模式，启动 PSYNC 同步流程
+// 加载RDB 或 直接增量 (当前只加载RDB,不解析)
 func (r *RedisSource) startPSync(ctx context.Context) error {
 	replID := r.ReplID()
 	offset := r.Offset()
@@ -411,18 +404,12 @@ func (r *RedisSource) updateDB(cmd *Command) {
 }
 
 func (r *RedisSource) Next(ctx context.Context) (Command, error) {
-	// 建立连接
+	// 状态检查：需要重新建立连接
 	if !r.connected.Load() {
-		if err := r.connect(); err != nil {
-			return Command{}, err
-		}
-		if err := r.startPSync(ctx); err != nil {
-			r.connected.Store(false)
-			r.resyncing.Store(false) // 连接失败，清除重新同步标记
-			return Command{}, err
-		}
+		return r.handleReconnection(ctx)
 	}
 
+	// 主循环：持续读取和处理命令
 	for {
 		select {
 		case <-ctx.Done():
@@ -430,49 +417,118 @@ func (r *RedisSource) Next(ctx context.Context) (Command, error) {
 		default:
 		}
 
-		line, err := r.reader.ReadString('\n')
+		// 读取一行数据
+		rawLine, err := r.reader.ReadString('\n')
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// 网络超时，继续尝试
 				continue
 			}
-			r.connected.Store(false)
-			r.resyncing.Store(false) // 读取失败，清除重新同步标记
-			return Command{}, fmt.Errorf("read failed: %w", err)
+			// 非超时错误，触发重连
+			r.resetConnection()
+			return Command{}, fmt.Errorf("read from connection failed: %w", err)
 		}
 
-		line = strings.TrimSuffix(line, "\r\n")
-		if line == "" {
-			continue
-		}
-
-		// 心跳包和状态响应
-		if strings.HasPrefix(line, "+") {
-			// +PONG, +OK, +CONTINUE 等都是状态响应，跳过
-			if line == "+PONG" || line == "+OK" || strings.HasPrefix(line, "+CONTINUE") || strings.HasPrefix(line, "+FULLRESYNC") {
-				continue
-			}
-		}
-
-		// 检查是否是命令格式（以 * 开头）
-		if !strings.HasPrefix(line, "*") {
-			// 不是命令格式，可能是其他类型的响应，跳过
-			// 减少日志输出频率
-			if r.offset.Load()%LogIntervalParsedCommand == 0 {
-				log.Infof("skipping non-command line: %q (offset: %d)", line, r.offset.Load())
-			}
-			continue
-		}
-
-		cmd, err := r.parseAOFCommand(line)
+		// 处理并解析该行数据
+		cmd, shouldContinue, err := r.processLine(ctx, rawLine)
 		if err != nil {
-			log.Infof("parse command failed: %v, line: %s", err, line)
-			continue
+			return Command{}, err
 		}
-
-		r.offset.Add(1)
-		log.Debugf("parsed AOF command: %s (key: %s, db: %d)", cmd.Name, cmd.Key, cmd.DB)
-		return cmd, nil
+		if !shouldContinue {
+			return cmd, nil
+		}
 	}
+}
+
+// 处理连接建立和PSYNC初始化
+func (r *RedisSource) handleReconnection(ctx context.Context) (Command, error) {
+	log.Debugf("establishing new connection to Redis")
+
+	// 1. 建立TCP连接
+	if err := r.connect(); err != nil {
+		return Command{}, fmt.Errorf("connection failed: %w", err)
+	}
+
+	// 2. 启动PSYNC同步
+	log.Infof("starting PSYNC synchronization (replid=%s, offset=%d)",
+		r.ReplID(), r.Offset())
+	if err := r.startPSync(ctx); err != nil {
+		r.resetConnection()
+		return Command{}, fmt.Errorf("PSYNC initialization failed: %w", err)
+	}
+
+	// 3. 标记连接成功
+	r.connected.Store(true)
+	log.Infof("connection established and PSYNC synchronized successfully")
+
+	// 返回空命令，让主循环继续处理
+	return Command{}, nil
+}
+
+// processLine 处理单行Redis协议数据
+func (r *RedisSource) processLine(ctx context.Context, rawLine string) (Command, bool, error) {
+	// 清理行尾
+	line := strings.TrimSuffix(rawLine, "\r\n")
+	if line == "" {
+		return Command{}, true, nil // 继续处理下一行
+	}
+
+	// 处理状态响应（跳过心跳和协议消息）
+	if strings.HasPrefix(line, "+") {
+		if r.shouldSkipStatusResponse(line) {
+			return Command{}, true, nil
+		}
+	}
+
+	// 跳过非命令格式的行（错误响应、整数响应等）
+	if !strings.HasPrefix(line, "*") {
+		return Command{}, true, nil
+	}
+
+	// 解析AOF命令
+	cmd, err := r.parseAOFCommand(line)
+	if err != nil {
+		log.Debugf("command parsing failed, skipping line: %v, line: %s", err, line)
+		return Command{}, true, nil
+	}
+
+	// 成功解析命令
+	r.offset.Add(1)
+	currentOffset := r.offset.Load()
+
+	log.Debugf("parsed command #%d: %s (key: %s, db: %d)",
+		currentOffset, cmd.Name, cmd.Key, cmd.DB)
+
+	return cmd, false, nil // 返回命令，停止继续处理
+}
+
+// shouldSkipStatusResponse 判断是否需要跳过的状态响应
+func (r *RedisSource) shouldSkipStatusResponse(line string) bool {
+	switch {
+	case line == "+PONG":
+		return true
+	case line == "+OK":
+		return true
+	case strings.HasPrefix(line, "+CONTINUE"):
+		log.Debugf("received CONTINUE response, continuing incremental sync")
+		return true
+	case strings.HasPrefix(line, "+FULLRESYNC"):
+		log.Debugf("received FULLRESYNC response, will load RDB")
+		return true
+	default:
+		return true
+	}
+}
+
+// resetConnection 重置连接状态
+func (r *RedisSource) resetConnection() {
+	r.connected.Store(false)
+	r.resyncing.Store(false)
+	if r.conn != nil {
+		r.conn.Close()
+		r.conn = nil
+	}
+	log.Debugf("connection reset, will attempt reconnection")
 }
 
 func (r *RedisSource) Offset() int64 {
@@ -488,27 +544,6 @@ func (r *RedisSource) ReplID() string {
 	return ""
 }
 
-func (r *RedisSource) SetReplID(id string) {
-	r.replID.Store(id)
-}
-
-func (r *RedisSource) IsConnected() bool {
-	return r.connected.Load()
-}
-
 func (r *RedisSource) IsResyncing() bool {
 	return r.resyncing.Load()
-}
-
-func (r *RedisSource) Reconnect() {
-	// 重置连接状态，强制下次 Next() 调用时重新连接和 PSYNC
-	r.connected.Store(false)
-	r.mu.Lock()
-	if r.conn != nil {
-		r.conn.Close()
-		r.conn = nil
-		r.reader = nil
-	}
-	r.mu.Unlock()
-	log.Infof("RedisSource reconnecting, will use PSYNC with replid=%s offset=%d", r.ReplID(), r.Offset())
 }

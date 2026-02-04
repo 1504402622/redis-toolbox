@@ -59,7 +59,7 @@ full_sync_on_start = true
 # 是否在 reader 断开超过时间后触发重新同步
 # true: reader 断开超时后触发重新同步
 # false: reader 断开后只重连，不触发重新同步
-reload_rdb_on_reader_disconnect = false
+reload_rdb_on_reader_disconnect = true
 # reader 断开超时时间（秒），超过此时间后触发重新同步
 # 建议设置为 60-600 秒（1-10 分钟）
 reader_disconnect_timeout_seconds = 1

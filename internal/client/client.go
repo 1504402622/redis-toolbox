@@ -73,65 +73,264 @@ func (r *ReaderClient) GetSource() CommandSource {
 	return r.source
 }
 
+// Start 启动读取器客户端
 func (r *ReaderClient) Start(ctx context.Context, reconnectInterval time.Duration) {
-	go func() {
-		for {
-			// 上下文取消时退出
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
+	go r.runReadingLoop(ctx, reconnectInterval)
+}
 
-			// 尝试连接并获取命令
-			cmd, err := r.source.Next(ctx)
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return
-				}
-				r.connected.Store(false)
-				log.Warnf("reader disconnected: %v", err)
-				time.Sleep(reconnectInterval)
-				continue
-			}
+// runReadingLoop 主读取循环
+func (r *ReaderClient) runReadingLoop(ctx context.Context, reconnectInterval time.Duration) {
+	defer r.handleShutdown()
 
-			// 连接成功，更新状态
-			if !r.connected.Load() {
-				r.connected.Store(true)
-				log.Infof("reader connected: %s", r.cfg.Addr)
-			}
-
-			// 选择数据库
-			r.updateDB(&cmd)
-			r.offset.Add(1)
-
-			// 过滤命令
-			if r.filter != nil && !r.filter.Allow(cmd) {
-				// 减少日志输出频率
-				if r.offset.Load()%LogIntervalCommandFiltered == 0 {
-					log.Infof("command filtered: %s (key: %s, db: %d, total: %d)", cmd.Name, cmd.Key, cmd.DB, r.offset.Load())
-				}
-				continue
-			}
-
-			// 跳过 PING/PONG 命令，不需要同步
-			if cmd.Name == "PING" || cmd.Name == "PONG" {
-				continue
-			}
-
-			// 直接发送到全局 channel（阻塞发送，确保不丢失命令）
-			select {
-			case <-ctx.Done():
-				return
-			case r.globalCh <- cmd:
-				// 命令已发送，减少日志输出频率
-				if r.offset.Load()%LogIntervalCommandSent == 0 {
-					log.Infof("command sent to global channel: %s (key: %s, db: %d, total: %d)",
-						cmd.Name, cmd.Key, cmd.DB, r.offset.Load())
-				}
-			}
+	for {
+		if ctx.Err() != nil {
+			return
 		}
-	}()
+
+		if err := r.readAndProcessCommands(ctx, reconnectInterval); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			r.handleReadError(err, reconnectInterval)
+		}
+	}
+}
+
+// readAndProcessCommands 读取和处理命令的主流程
+func (r *ReaderClient) readAndProcessCommands(ctx context.Context, reconnectInterval time.Duration) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// 读取下一个命令
+		cmd, err := r.readNextCommand(ctx)
+		if err != nil {
+			return err
+		}
+
+		// 处理命令
+		if !r.processCommand(ctx, cmd) {
+			continue
+		}
+	}
+}
+
+// readNextCommand 从源读取下一个命令
+func (r *ReaderClient) readNextCommand(ctx context.Context) (Command, error) {
+	cmd, err := r.source.Next(ctx)
+	if err != nil {
+		return Command{}, err
+	}
+
+	// 更新连接状态
+	r.updateConnectionStatus(true)
+
+	return cmd, nil
+}
+
+// updateConnectionStatus 更新连接状态
+func (r *ReaderClient) updateConnectionStatus(status bool) {
+	r.connected.Store(status)
+	statusDesc := "disconnected"
+	if status {
+		statusDesc = "connected"
+	}
+	log.Infof("reader client connection status updated: addr=%s, status=%s", r.cfg.Addr, statusDesc)
+}
+
+// processCommand 处理单个命令
+func (r *ReaderClient) processCommand(ctx context.Context, cmd Command) bool {
+	// 更新数据库选择和偏移量
+	r.updateDB(&cmd)
+	r.offset.Add(1)
+
+	// 应用过滤器
+	if !r.applyFilters(cmd) {
+		return false
+	}
+
+	// 发送到全局通道
+	if !r.sendToGlobalChannel(ctx, cmd) {
+		return false
+	}
+
+	return true
+}
+
+// applyFilters 应用所有过滤器
+func (r *ReaderClient) applyFilters(cmd Command) bool {
+	if skip, reason := shouldSkipCommand(cmd); skip {
+		logFilteredCommand(cmd, r.offset.Load(), reason)
+		return false
+	}
+
+	// 应用自定义过滤器
+	if r.filter != nil && !r.filter.Allow(cmd) {
+		logFilteredCommand(cmd, r.offset.Load(), "custom filter")
+		return false
+	}
+
+	return true
+}
+
+// shouldSkipCommand 完整的命令过滤方法
+func shouldSkipCommand(cmd Command) (bool, string) {
+	// 1. 跳过心跳和连接管理命令
+	if cmd.Name == "PING" || cmd.Name == "PONG" || cmd.Name == "QUIT" {
+		return true, "heartbeat/connection command"
+	}
+
+	// 2. 跳过复制相关命令
+	if cmd.Name == "REPLCONF" || cmd.Name == "SYNC" || cmd.Name == "PSYNC" ||
+		cmd.Name == "REPLICAOF" || cmd.Name == "SLAVEOF" || cmd.Name == "ROLE" ||
+		cmd.Name == "WAIT" {
+		return true, "replication command"
+	}
+
+	// 3. 跳过哨兵相关命令
+	if cmd.Name == "SENTINEL" {
+		return true, "sentinel command"
+	}
+
+	// 4. 跳过集群相关命令
+	if cmd.Name == "CLUSTER" || cmd.Name == "MOVED" || cmd.Name == "ASK" {
+		return true, "cluster command"
+	}
+
+	// 5. 跳过订阅发布命令
+	if cmd.Name == "SUBSCRIBE" || cmd.Name == "PSUBSCRIBE" ||
+		cmd.Name == "UNSUBSCRIBE" || cmd.Name == "PUNSUBSCRIBE" ||
+		cmd.Name == "PUBLISH" || cmd.Name == "PUBSUB" {
+		return true, "pubsub command"
+	}
+
+	// 6. 跳过事务相关命令
+	if cmd.Name == "MULTI" || cmd.Name == "EXEC" || cmd.Name == "DISCARD" ||
+		cmd.Name == "WATCH" || cmd.Name == "UNWATCH" {
+		return true, "transaction command"
+	}
+
+	// 7. 跳过监控命令
+	if cmd.Name == "MONITOR" {
+		return true, "monitor command"
+	}
+
+	// 8. 跳过配置命令
+	if cmd.Name == "CONFIG" {
+		return true, "config command"
+	}
+
+	// 9. 跳过客户端管理命令
+	if cmd.Name == "CLIENT" || cmd.Name == "HELLO" || cmd.Name == "AUTH" {
+		return true, "client management command"
+	}
+
+	// 10. 跳过慢查询命令
+	if cmd.Name == "SLOWLOG" {
+		return true, "slowlog command"
+	}
+
+	// 11. 跳过调试命令
+	if cmd.Name == "DEBUG" || cmd.Name == "LATENCY" || cmd.Name == "MEMORY" {
+		return true, "debug/monitoring command"
+	}
+
+	// 12. 跳过危险命令（数据修改）
+	if cmd.Name == "FLUSHALL" || cmd.Name == "FLUSHDB" ||
+		cmd.Name == "SHUTDOWN" || cmd.Name == "SAVE" ||
+		cmd.Name == "BGSAVE" || cmd.Name == "BGREWRITEAOF" {
+		return true, "dangerous command"
+	}
+
+	// 13. 跳过连接命令
+	if cmd.Name == "ECHO" || cmd.Name == "SELECT" {
+		return true, "connection command"
+	}
+
+	// 14. 跳过INFO命令的某些部分
+	if cmd.Name == "INFO" {
+		return true, "info "
+	}
+
+	// 15. 跳过时间相关命令
+	if cmd.Name == "TIME" {
+		return true, "time command"
+	}
+
+	// 16. 跳过键空间命令
+	if cmd.Name == "KEYS" || cmd.Name == "SCAN" || cmd.Name == "RANDOMKEY" {
+		return true, "keyspace command"
+	}
+
+	// 17. 跳过脚本命令
+	if cmd.Name == "SCRIPT" || cmd.Name == "EVAL" || cmd.Name == "EVALSHA" {
+		return true, "script command"
+	}
+
+	// 18. 跳过模块命令
+	if cmd.Name == "MODULE" {
+		return true, "module command"
+	}
+
+	// 19. 检查 REPLCONF 的子命令
+	if cmd.Name == "REPLCONF" {
+		return true, "replconf "
+	}
+
+	// 20. 响应字符串（通常不是命令，但以防万一）
+	if cmd.Name == "OK" || cmd.Name == "QUEUED" || cmd.Name == "CONTINUE" ||
+		cmd.Name == "FULLRESYNC" {
+		return true, "response string"
+	}
+
+	// 所有其他命令不跳过
+	return false, ""
+}
+
+// logFilteredCommand 记录被过滤的命令（控制频率）
+func logFilteredCommand(cmd Command, offset int64, reason string) {
+	log.Debugf("command filtered: %s (key: %s, db: %d, reason: %s, total: %d)",
+		cmd.Name, cmd.Key, cmd.DB, reason, offset)
+}
+
+// sendToGlobalChannel 发送命令到全局通道
+func (r *ReaderClient) sendToGlobalChannel(ctx context.Context, cmd Command) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case r.globalCh <- cmd:
+		r.logCommandSent(cmd)
+		return true
+	}
+}
+
+// logCommandSent 记录已发送的命令（控制频率）
+func (r *ReaderClient) logCommandSent(cmd Command) {
+	offset := r.offset.Load()
+	if offset%LogIntervalCommandSent == 0 {
+		log.Infof("command sent to channel: %s (key: %s, db: %d, total: %d)",
+			cmd.Name, cmd.Key, cmd.DB, offset)
+	}
+}
+
+// handleReadError 处理读取错误
+func (r *ReaderClient) handleReadError(err error, reconnectInterval time.Duration) {
+	r.updateConnectionStatus(false)
+
+	// 等待重连间隔
+	select {
+	case <-time.After(reconnectInterval):
+		log.Infof("attempting to reconnect...")
+	}
+}
+
+// handleShutdown 处理关闭逻辑
+func (r *ReaderClient) handleShutdown() {
+	log.Infof("reader client shutting down")
+	r.updateConnectionStatus(false)
 }
 
 func (r *ReaderClient) updateDB(cmd *Command) {
@@ -173,23 +372,14 @@ func (r *ReaderClient) IsConnected() bool {
 	return r.connected.Load()
 }
 
-func (r *ReaderClient) Reconnect() {
-	// 标记为已重连，实际重连逻辑在 source.Next() 中处理
-	// 如果 source 是 RedisSource，它会检测 connected=false 并重新连接
-	r.connected.Store(true)
-	log.Infof("reader reconnected: %s", r.cfg.Addr)
-}
-
 func (r *ReaderClient) MarkNeedRDB(value bool) {
 	// Reader 不需要标记 RDB，因为 RDB 是从源端加载的
 	// 如果需要重新加载 RDB，应该重置 source 的连接状态
 	if value {
-		r.connected.Store(false)
+		r.updateConnectionStatus(false)
 		// 重置 offset 和 replID，强制下次连接时重新进行 FULLRESYNC
 		r.offset.Store(0)
 		r.replID.Store("")
-		// 如果 source 有 Reconnect 方法，调用它
-		// 注意：RedisSource 的 Reconnect 会设置 connected=false，触发重新连接
 	}
 }
 

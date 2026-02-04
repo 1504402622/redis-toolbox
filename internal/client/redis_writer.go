@@ -63,6 +63,7 @@ func (w *RedisWriter) WriteBatch(ctx context.Context, cmds []Command) error {
 	}
 
 	pipe := w.client.Pipeline()
+
 	for _, cmd := range cmds {
 		// 切换数据库
 		if cmd.DB != 0 {
@@ -138,9 +139,13 @@ func (w *RedisWriter) WriteBatch(ctx context.Context, cmds []Command) error {
 		}
 	}
 
+	if pipe.Len() == 0 {
+		return nil
+	}
+
 	_, err := pipe.Exec(ctx)
 	if err != nil {
-		w.connected.Store(false)
+		// w.connected.Store(false)
 		return fmt.Errorf("pipeline exec failed: %w", err)
 	}
 

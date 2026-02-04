@@ -67,7 +67,10 @@ func (s *Service) Start(ctx context.Context) {
 	log.Infof("starting writer: %s", s.cfg.Writer.Addr)
 	go s.runWriter(ctx, s.writer, reconnectInterval)
 
+	// 启动 sync
 	go s.dispatchWriter(ctx, reconnectInterval)
+
+	// 启动 monitor 监控
 	go s.monitor(ctx, reconnectInterval)
 }
 
@@ -193,7 +196,6 @@ func (s *Service) sendToWriter(ctx context.Context, cmds []client.Command, recon
 	return nil
 }
 
-// runWriter 后台保持 writer 连接，定期检查并重连
 // 注意：实际的写入操作在 dispatchWriter 中处理，此函数仅负责连接保活
 func (s *Service) runWriter(ctx context.Context, writer *client.RedisWriter, reconnectInterval time.Duration) {
 	ticker := time.NewTicker(reconnectInterval)
@@ -235,27 +237,22 @@ func (s *Service) dropAll(reason string) {
 func (s *Service) performFullReload(reason string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	if !s.needFullReload.Load() {
 		return
 	}
 
-	// 检查是否正在重新同步，如果是则不打印日志
+	// 检查是否正在重新同步，如果是则直接返回，避免重复操作
 	isResyncing := false
 	if redisSource, ok := s.reader.GetSource().(*client.RedisSource); ok {
 		isResyncing = redisSource.IsResyncing()
 	}
-
-	s.needFullReload.Store(false)
-	s.drainChannel(s.globalCh)
-
-	// 标记 reader 需要重新同步
-	s.reader.MarkNeedRDB(true)
-
-	// 如果不在重新同步中，才打印日志
-	if !isResyncing {
-		log.Warnf("full reload triggered: %s", reason)
+	if isResyncing {
+		return
 	}
+	s.drainChannel(s.globalCh)
+	s.reader.MarkNeedRDB(true)
+	s.needFullReload.Store(false)
+	log.Warnf("full reload triggered: %s", reason)
 }
 
 func (s *Service) drainChannel(ch chan client.Command) {
@@ -344,7 +341,6 @@ func (s *Service) checkReaders() {
 
 	if s.cfg.Sync.ReloadRDBOnReaderDisconnect && disconnectDuration >= timeoutDuration {
 		if redisSource, ok := s.reader.GetSource().(*client.RedisSource); ok && redisSource.IsResyncing() {
-			s.needFullReload.Store(true)
 			s.readerDisconnectTime = nil
 			return
 		}
